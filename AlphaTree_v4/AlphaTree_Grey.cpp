@@ -5,10 +5,15 @@
 #include <assert.h>
 #include <float.h>
 #include <string.h>
-#include <opencv2/opencv.hpp>
 #include <time.h>
+#include <opencv2/opencv.hpp>
+#include <filesystem>
+#include <iostream>
+using namespace std;
 
-#define DEBUG 0
+#define INPUTIMAGE_DIR	"C:/Users/jwryu/Google Drive/RUG/2018/AlphaTree/imgdata/Colour"
+
+#define DEBUG 1
 #define max(a,b) (a)>(b)?(a):(b)
 #define min(a,b) (a)>(b)?(b):(a)
 
@@ -26,6 +31,8 @@
 #define UP_AVAIL(pidx,width)				((pidx) > ((width) - 1))
 #define DOWN_AVAIL(pidx,width,imgsz)		((pidx) < (imgsz) - (width))
 
+#define M_PI       3.14159265358979323846 
+
 #define HQUEUE_ELEMENT_SIZE		4
 #define LEVELROOT_ELEMENT_SIZE	8
 #define DHIST_ELEMENT_SIZE		4
@@ -37,7 +44,30 @@ typedef unsigned short uint16;
 typedef unsigned long uint32;
 typedef unsigned long long uint64;
 
-typedef uint8 pixel; //designed for 8-bit images
+typedef uint8 pixel[3]; //designed for 8-bit images
+
+
+#if DEBUG
+void* buf;
+uint64 bufsize;
+void save_buf(void* src, uint64 size)
+{
+	memcpy(buf, src, size);
+	bufsize = size;
+}
+
+uint8 isChanged(void *src)
+{
+	uint64 i;
+	for (i = 0; i < bufsize; i++)
+	{
+		if (((uint8*)buf)[i] != ((uint8*)src)[i])
+			return 1;
+	}
+	return 0;
+}
+
+#endif
 
 typedef struct HQueue
 {
@@ -58,7 +88,6 @@ HQueue* hqueue_new(uint64 qsize, uint32 *dhist, uint32 dhistsize)
 	hqueue->qsize = qsize;
 	hqueue->min_level = hqueue->max_level = dhistsize;
 
-	
 	int sum_hist = 0;
 	for (i = 0; i < dhistsize; i++)
 	{
@@ -104,7 +133,7 @@ typedef struct AlphaNode
 {
 	uint32 area;
 	uint8 level;  /* alpha of flat zone */
-	double sumPix;
+	double sumPix[3];
 	pixel minPix;
 	pixel maxPix;
 	uint32 parentidx;
@@ -120,96 +149,94 @@ typedef struct AlphaTree
 } AlphaTree;
 
 
-inline void connectPix2Node(uint32* parentAry, uint32 pidx, uint8 pix_val, AlphaNode* pNode, uint32 iNode)
+inline void connectPix2Node(uint32* parentAry, uint32 pidx, pixel pix_val, AlphaNode* pNode, uint32 iNode)
 {
 	parentAry[pidx] = iNode;
 	pNode->area++;
-	pNode->maxPix = max(pNode->maxPix, pix_val);
-	pNode->minPix = min(pNode->minPix, pix_val);
-	pNode->sumPix += pix_val;
+	pNode->maxPix[0] = max(pNode->maxPix[0], pix_val[0]);
+	pNode->maxPix[1] = max(pNode->maxPix[1], pix_val[1]);
+	pNode->maxPix[2] = max(pNode->maxPix[2], pix_val[2]);
+	pNode->minPix[0] = min(pNode->minPix[0], pix_val[0]);
+	pNode->minPix[1] = min(pNode->minPix[1], pix_val[1]);
+	pNode->minPix[2] = min(pNode->minPix[2], pix_val[2]);
+	pNode->sumPix[0] += pix_val[0];
+	pNode->sumPix[1] += pix_val[1];
+	pNode->sumPix[2] += pix_val[2];
 }
 
 inline void connectNode2Node(AlphaNode* pPar, uint32 iPar, AlphaNode* pNode)
 {
 	pNode->parentidx = iPar;
 	pPar->area += pNode->area;
-	pPar->maxPix = max(pNode->maxPix, pPar->maxPix);
-	pPar->minPix = min(pNode->minPix, pPar->minPix);
-	pPar->sumPix += pNode->sumPix;
+	pPar->maxPix[0] = max(pNode->maxPix[0], pPar->maxPix[0]);
+	pPar->maxPix[1] = max(pNode->maxPix[1], pPar->maxPix[1]);
+	pPar->maxPix[2] = max(pNode->maxPix[2], pPar->maxPix[2]);
+	pPar->minPix[0] = min(pNode->minPix[0], pPar->minPix[0]);
+	pPar->minPix[1] = min(pNode->minPix[1], pPar->minPix[1]);
+	pPar->minPix[2] = min(pNode->minPix[2], pPar->minPix[2]);
+	pPar->sumPix[0] += pNode->sumPix[0];
+	pPar->sumPix[1] += pNode->sumPix[1];
+	pPar->sumPix[2] += pNode->sumPix[2];
 }
 
-void compute_dimg(uint8* dimg, uint32* dhist, uint8* img, uint32 height, uint32 width, uint32 channel)
+inline uint8 Lmax_dissim(pixel *img, uint32 p, uint32 q)
+{
+	uint8 d0, d1, d2;
+
+	d0 = (uint8)(abs((int)img[p][0] - (int)img[q][0]));
+	d1 = (uint8)(abs((int)img[p][1] - (int)img[q][1]));
+	d2 = (uint8)(abs((int)img[p][2] - (int)img[q][2]));
+
+	return max(d0, max(d1, d2));
+}
+
+void compute_dimg(uint8* dimg, uint32* dhist, pixel* img, uint32 height, uint32 width, uint32 channel)
 {
 
-	uint32 dimgidx, imgidx, stride_w = width, i, j, ch;
-	if (channel == 1)
+	uint32 dimgidx, imgidx, stride_w = width, i, j;
+
+	imgidx = dimgidx = 0;
+	for (i = 0; i < height - 1; i++)
 	{
-		imgidx = dimgidx = 0;
-		for (i = 0; i < height - 1; i++)
-		{
-			for (j = 0; j < width - 1; j++)
-			{
-				dimg[dimgidx] = (uint8)abs((int)img[imgidx + stride_w] - (int)img[imgidx]);
-				dhist[dimg[dimgidx++]]++;
-				dimg[dimgidx] = (uint8)abs((int)img[imgidx + 1] - (int)img[imgidx]);
-				dhist[dimg[dimgidx++]]++;
-				imgidx++;
-			}
-			dimg[dimgidx] = (uint8)abs((int)img[imgidx + stride_w] - (int)img[imgidx]);
-			dhist[dimg[dimgidx++]]++;
-			dimgidx++;
-			imgidx++;
-		}
 		for (j = 0; j < width - 1; j++)
 		{
-			dimgidx++;
-			dimg[dimgidx] = (uint8)abs((int)img[imgidx + 1] - (int)img[imgidx]);
+			dimg[dimgidx] = Lmax_dissim(img, imgidx + stride_w, imgidx);
+			dhist[dimg[dimgidx++]]++;
+			dimg[dimgidx] = Lmax_dissim(img, imgidx + 1, imgidx); 
 			dhist[dimg[dimgidx++]]++;
 			imgidx++;
 		}
+		dimg[dimgidx] = Lmax_dissim(img, imgidx + stride_w, imgidx);
+		dhist[dimg[dimgidx++]]++;
+		dimgidx++;
+		imgidx++;
 	}
-	else
+	for (j = 0; j < width - 1; j++)
 	{
-		for (ch = 0; ch < channel; ch++)
-		{
-			imgidx = dimgidx = 0;
-			for (i = 0; i < height - 1; i++)
-			{
-				for (j = 0; j < width - 1; j++)
-				{
-					dimg[dimgidx++] = max(dimg[dimgidx], (uint8)abs((int)img[imgidx + stride_w] - (int)img[imgidx])); // use Lmax dissim
-					if (ch == channel - 1)
-						dhist[dimg[dimgidx - 1]]++;
-					dimg[dimgidx++] = max(dimg[dimgidx], (uint8)abs((int)img[imgidx + 1] - (int)img[imgidx]));
-					if (ch == channel - 1)
-						dhist[dimg[dimgidx - 1]]++;
-					imgidx++;
-				}
-				dimg[dimgidx++] = max(dimg[dimgidx], (uint8)abs((int)img[imgidx + stride_w] - (int)img[imgidx]));
-				if (ch == channel - 1)
-					dhist[dimg[dimgidx - 1]]++;
-				dimgidx++;
-				imgidx++;
-			}
-			for (j = 0; j < width - 1; j++)
-			{
-				dimgidx++;
-				dimg[dimgidx++] = max(dimg[dimgidx], (uint8)abs((int)img[imgidx + 1] - (int)img[imgidx]));
-				if (ch == channel - 1)
-					dhist[dimg[dimgidx - 1]]++;
-				imgidx++;
-			}
-			img += width * height;
-		}
+		dimgidx++;
+		dimg[dimgidx] = Lmax_dissim(img, imgidx + 1, imgidx);
+		dhist[dimg[dimgidx++]]++;
+		imgidx++;
 	}
+	img += width * height;
 }
+
+
 inline uint32 NewAlphaNode(AlphaTree* tree, uint8 level)
 {
 	AlphaNode *pNew = tree->node + tree->curSize;
+	
+	if (tree->curSize == tree->maxSize)
+	{
+		printf("Reallocating...\n");
+		tree->maxSize = tree->height * tree->width;
+		tree->node = (AlphaNode*)realloc(tree->node, tree->maxSize = tree->height * tree->width * sizeof(AlphaNode));
+		pNew = tree->node + tree->curSize;
+	}
 	pNew->level = level;
-	pNew->minPix = (pixel)-1;
-	pNew->minPix = 0;
-	pNew->sumPix = 0.0;
+	pNew->minPix[0] = pNew->minPix[1] = pNew->minPix[2] = (uint8)-1;
+	pNew->minPix[0] = pNew->minPix[1] = pNew->minPix[2] = 0;
+	pNew->sumPix[0] = pNew->sumPix[1] = pNew->sumPix[2] = 0.0;
 	pNew->parentidx = 0;
 	pNew->area = 0;
 
@@ -226,18 +253,17 @@ inline void visit(uint8* isVisited, uint32 p)
 	isVisited[p >> 3] = isVisited[p >> 3] | (1 << (p & 7));
 }
 
-
-void Flood(AlphaTree* tree, uint8* img, uint32 height, uint32 width, uint32 channel)
+void Flood(AlphaTree* tree, pixel* img, uint32 height, uint32 width, uint32 channel)
 {
 	uint32 imgsize, dimgsize, nredges, max_level, current_level, next_level, x0, p, dissim;
 	uint32 numlevels;
 	HQueue* hqueue;
 	uint32 *dhist;
-	pixel *dimg;
+	uint8 *dimg;
 	uint32 iChild, *levelroot;
 	uint8 *isVisited;
-	AlphaNode *pNode;
 	uint32 *pParentAry;
+	double nrmsd;
 
 	imgsize = width * height;
 	nredges = width * (height - 1) + (width - 1) * height;
@@ -249,9 +275,9 @@ void Flood(AlphaTree* tree, uint8* img, uint32 height, uint32 width, uint32 chan
 
 
 	dhist = (uint32*)malloc((size_t)numlevels * sizeof(uint32));
-	dimg = (pixel*)malloc((size_t)dimgsize * sizeof(pixel));
+	dimg = (uint8*)malloc((size_t)dimgsize * sizeof(uint8));
 	levelroot = (uint32*)malloc((uint32)(numlevels + 1) * LEVELROOT_ELEMENT_SIZE);
-	isVisited = (uint8*)malloc((size_t)(imgsize >> 3));
+	isVisited = (uint8*)malloc((size_t)((imgsize + 7) >> 3));
 	for (p = 0; p < numlevels; p++)
 		levelroot[p] = NULL_LEVELROOT;
 	memset(dhist, 0, (size_t)numlevels * sizeof(uint32));
@@ -267,18 +293,37 @@ void Flood(AlphaTree* tree, uint8* img, uint32 height, uint32 width, uint32 chan
 	tree->width = width;
 	tree->channel = channel;
 	tree->curSize = 0;
-	tree->maxSize = imgsize + 1;//tree size estimation
+	
+	//tree size estimation
+	double tmp1, tmp2, tmp3;
+
+	nrmsd = 0;
+	for (p = 0; p < numlevels; p++)
+		nrmsd += dhist[p] * dhist[p];
+	tmp1 = nrmsd - (double)nredges;
+	tmp2 = sqrt(tmp1);
+	tmp3 = tmp2 / ((double)nredges - 1.0);
+	
+	nrmsd = sqrt(nrmsd - (double)nredges) / ((double)nredges - 1.0);
+	   
+	tree->maxSize = min(imgsize, (uint32)(imgsize * (exp(-M_PI * nrmsd) + 0.04)));
+
 	tree->parentAry = (uint32*)malloc((size_t)imgsize * sizeof(uint32));
 	tree->node = (AlphaNode*)malloc((size_t)tree->maxSize * sizeof(AlphaNode));
-	pNode = tree->node;
 	pParentAry = tree->parentAry;
 
 	levelroot[max_level + 1] = NewAlphaNode(tree, (uint8)max_level);
-	pNode[levelroot[max_level + 1]].parentidx = levelroot[max_level + 1];
+	tree->node[levelroot[max_level + 1]].parentidx = levelroot[max_level + 1];
 
 	current_level = max_level;
 	x0 = imgsize >> 1;
 	hqueue_push(hqueue, x0, current_level);
+
+	free(dhist);
+
+	buf = (void*)malloc((imgsize >> 3));
+	save_buf((void*)isVisited, (imgsize >> 3));
+	int changed = 0, visitcnt = 0;;
 
 	iChild = levelroot[max_level + 1];
 	while (current_level <= max_level)
@@ -352,18 +397,19 @@ void Flood(AlphaTree* tree, uint8* img, uint32 height, uint32 width, uint32 chan
 			if (levelroot[current_level] == ANODE_CANDIDATE)
 				levelroot[current_level] = NewAlphaNode(tree, (uint8)current_level);
 #endif
-			connectPix2Node(pParentAry, p, img[p], pNode + levelroot[current_level], levelroot[current_level]);
+			connectPix2Node(pParentAry, p, img[p], tree->node + levelroot[current_level], levelroot[current_level]);
+
 		}
 //		if(tree->curSize > 22051838 && (tree->curSize))
 	//		printf("curSize: %d\n",tree->curSize);
 		//Redundant node removal
-		if (pNode[iChild].parentidx == levelroot[current_level] &&
-			pNode[levelroot[current_level]].area == pNode[iChild].area)
+		if (tree->node[iChild].parentidx == levelroot[current_level] &&
+			tree->node[levelroot[current_level]].area == tree->node[iChild].area)
 		{
 			levelroot[current_level] = iChild;
 			tree->curSize--;
 			
-			memset((uint8*)(pNode + tree->curSize), 0, sizeof(AlphaNode));
+			memset((uint8*)(tree->node + tree->curSize), 0, sizeof(AlphaNode));
 		}
 
 		next_level = current_level + 1;
@@ -371,20 +417,21 @@ void Flood(AlphaTree* tree, uint8* img, uint32 height, uint32 width, uint32 chan
 			next_level++;
 		if (levelroot[next_level] == ANODE_CANDIDATE)
 			levelroot[next_level] = NewAlphaNode(tree, (uint8)next_level);
-		connectNode2Node(pNode + levelroot[next_level], levelroot[next_level], pNode + levelroot[current_level]);
+		connectNode2Node(tree->node + levelroot[next_level], levelroot[next_level], tree->node + levelroot[current_level]);
+
 		iChild = levelroot[current_level];
 		levelroot[current_level] = NULL_LEVELROOT;
 		current_level = next_level;
+
 	}
 	hqueue_free(hqueue);
-	free(dhist);
 	free(dimg);
 	free(levelroot);
 	free(isVisited);
 }
 
 
-void BuildAlphaTree(AlphaTree* tree, uint8 *img, uint32 height, uint32 width, uint32 channel)
+void BuildAlphaTree(AlphaTree* tree, pixel *img, uint32 height, uint32 width, uint32 channel)
 {
 	Flood(tree, img, height, width, channel);
 }
@@ -396,12 +443,79 @@ void DeleteAlphaTree(AlphaTree* tree)
 	free(tree);
 }
 
+// reshape 3d image matrix (ch,x,y) -> (x,y,ch)
+void imreshape(uint8* dst, uint8* src, uint32 height, uint32 width)
+{
+	uint32 ch, i, dstidx, srcidx;
+	srcidx = 0;
+	for (ch = 0; ch < 3; ch++)
+	{
+		dstidx = ch;
+		for (i = 0; i < height * width; i++)
+		{
+			dst[dstidx] = src[srcidx++];
+			dstidx += 3;
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {	
-	cv::String str1("C:/jwryu/RUG/2018/AlphaTree/imgdata/Colour_imgs/44767133841_7b7ec3ccf6_o.jpg");
-	cv::Mat img = imread(str1, cv::IMREAD_ANYCOLOR);
-	AlphaTree tree;
+	AlphaTree *tree;
+	pixel *img;
+	uint32 width, height, channel;
+	uint32 cnt = 0;
 
+	std::string path = INPUTIMAGE_DIR;
+	for (auto & p : std::experimental::filesystem::directory_iterator(path))
+	{
+		if (cnt++ < 645 - 2) 
+		{
+			//continue;
+		}
+		cv::String str1(p.path().string().c_str());
+		cv::Mat cvimg = imread(str1, cv::IMREAD_ANYCOLOR);
+		
+		height = cvimg.rows;
+		width = cvimg.cols;
+		channel = cvimg.channels();
+
+		cout << cnt << ": " << str1 << ' ' << height << 'x' << width << endl;
+		
+		if (channel != 3)
+		{
+			cout << "input should be a 3-ch image" << endl;
+			getc(stdin);
+			exit(-1);
+		}
+
+		img = (pixel*)malloc(height * width * sizeof(pixel));
+		imreshape((uint8*)img, cvimg.data, height, width);
+		cvimg.release();
+		str1.clear();
+
+		clock_t start, stop;
+
+		//	printf("Image size: %dx%dx%d", img.rows, img.cols, img.channels());
+			//	gettimeofday(&start, NULL);
+		tree = (AlphaTree*)malloc(sizeof(AlphaTree));
+		start = clock();
+		BuildAlphaTree(tree, img, height, width, channel);
+		stop = clock();
+		//	gettimeofday(&stop, NULL);
+		//		namedWindow("disp", WINDOW_AUTOSIZE); // Create a window for display.
+			//	imshow("disp", img);                // Show our image inside it.
+				//waitKey(0);
+		cout<<"Time Elapsed: " << (double)(stop - start) / 1000.0 << endl;
+		//getc(stdin);
+		free(img);
+		DeleteAlphaTree(tree);
+	}
+
+
+	
+
+	
 		//	cv::String str("C:/jwryu/RUG/2018/AlphaTree/imgdata/Colour_imgs/16578511714_6eaef1c5bb_o.jpg");
 //	cv::Mat img = imread(str, CV_LOAD_IMAGE_COLOR);
 //	cv::String str("C:/jwryu/RUG/2018/AlphaTree/imgdata/Aerial_Grey/s-gravenhage_33696704805_o.jpg");
@@ -426,21 +540,7 @@ int main(int argc, char **argv)
 
 	//AlphaTree aTree;
 	//	struct timeval stop, start;
-	clock_t start, stop;
-
-//	printf("Image size: %dx%dx%d", img.rows, img.cols, img.channels());
-	//	gettimeofday(&start, NULL);
-	start = clock();
-	BuildAlphaTree(&tree, (uint8*)img.data, img.rows, img.cols, img.channels());
-//	BuildAlphaTree(&tree, (uint8*)img1.data, height, width, channel);
-	stop = clock();
-	//	gettimeofday(&stop, NULL);
-	//		namedWindow("disp", WINDOW_AUTOSIZE); // Create a window for display.
-		//	imshow("disp", img);                // Show our image inside it.
-			//waitKey(0);
-	printf("Time Elapsed: %f", (double)(stop - start) / 1000.0);
-	getc(stdin);
-//	free(img);
-	img.release();
+	
+//	img.release();
 	return 0;
 }
