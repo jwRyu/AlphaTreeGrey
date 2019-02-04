@@ -7,15 +7,21 @@
 #include <string.h>
 #include <time.h>
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
 using namespace std;
 
-#define INPUTIMAGE_DIR	"C:/Users/jwryu/Google Drive/RUG/2018/AlphaTree/imgdata/Grey"
-#define REPEAT 1
+#define OUTPUT_FNAME "C:/Users/jwryu/RUG/2018/AlphaTree/test.dat"
 
-#define DEBUG 1
+#define INPUTIMAGE_DIR	"C:/Users/jwryu/Google Drive/RUG/2018/AlphaTree/imgdata/Grey"
+#define INPUTIMAGE_DIR_COLOUR	"C:/Users/jwryu/Google Drive/RUG/2018/AlphaTree/imgdata/Colour" //colour images are used after rgb2grey conversion
+#define REPEAT 10
+#define RUN_TSE_ONLY 0
+
+#define DEBUG 0
 #define max(a,b) (a)>(b)?(a):(b)
 #define min(a,b) (a)>(b)?(b):(a)
 
@@ -33,13 +39,20 @@ using namespace std;
 #define UP_AVAIL(pidx,width)				((pidx) > ((width) - 1))
 #define DOWN_AVAIL(pidx,width,imgsz)		((pidx) < (imgsz) - (width))
 
-#define M_PI       3.14159265358979323846 
+#define A		1.10184
+#define SIGMA	-2.6912
+#define B		-0.0608
+#define M		0.03
 
-#define HQUEUE_ELEMENT_SIZE		4
-#define LEVELROOT_ELEMENT_SIZE	8
-#define DHIST_ELEMENT_SIZE		4
-#define DIMG_ELEMENT_SIZE		1
-#define ISVISITED_ELEMENT_SIZE	1
+//Memory allocation reallocation schemes
+#define TSE 0
+#define MAXIMUM 1
+#define LINEAR 2
+#define EXP 3
+int mem_scheme = -1;
+double size_init[4] = { -1, 1, .2, .15 };
+double size_mul[4] = { 1, 1, 1, 2 };
+double size_add[4] = { .05, 0, 0.15, 0 };
 
 typedef unsigned char uint8;
 typedef unsigned short uint16;
@@ -48,7 +61,7 @@ typedef unsigned long long uint64;
 
 typedef uint8 pixel; //designed for 8-bit images
 
-double rmsd, nrmsd;
+double nrmsd;
 
 size_t memuse, max_memuse;
 
@@ -70,9 +83,7 @@ uint8 isChanged(void *src)
 	}
 	return 0;
 }
-
 #endif
-
 
 inline void* Malloc(size_t size)
 {
@@ -85,8 +96,26 @@ inline void* Malloc(size_t size)
 	return (void*)((size_t*)pNew + 1);
 }
 
+inline void* Realloc(void* ptr, size_t size)
+{
+	void* pOld = (void*)((size_t*)ptr - 1);
+	size_t oldsize = *((size_t*)pOld);
+	void* pNew = realloc(pOld, size + sizeof(size_t));
+
+	if (pOld != pNew)
+		max_memuse = max(memuse + size, max_memuse);
+	else
+		max_memuse = max(memuse + size - oldsize, max_memuse);
+	memuse += size - oldsize;
+
+	*((size_t*)pNew) = size;
+	return (void*)((size_t*)pNew + 1);
+}
+
 inline void Free(void* ptr)
 {
+	size_t size = *((size_t*)ptr - 1);
+	memuse -= size;
 	free((void*)((size_t*)ptr - 1));
 }
 
@@ -190,7 +219,6 @@ inline void connectNode2Node(AlphaNode* pPar, uint32 iPar, AlphaNode* pNode)
 
 void compute_dimg(uint8* dimg, uint32* dhist, pixel* img, uint32 height, uint32 width, uint32 channel)
 {
-
 	uint32 dimgidx, imgidx, stride_w = width, i, j;
 
 	imgidx = dimgidx = 0;
@@ -216,7 +244,6 @@ void compute_dimg(uint8* dimg, uint32* dhist, pixel* img, uint32 height, uint32 
 		dhist[dimg[dimgidx++]]++;
 		imgidx++;
 	}
-	img += width * height;
 }
 
 
@@ -227,8 +254,9 @@ inline uint32 NewAlphaNode(AlphaTree* tree, uint8 level)
 	if (tree->curSize == tree->maxSize)
 	{
 		printf("Reallocating...\n");
-		tree->maxSize = tree->height * tree->width;
-		tree->node = (AlphaNode*)realloc(tree->node, tree->maxSize = tree->height * tree->width * sizeof(AlphaNode));
+		tree->maxSize = min(tree->height * tree->width, (uint32)(size_mul[mem_scheme] * tree->maxSize) + (uint32)(tree->height * tree->width * size_add[mem_scheme]));
+		
+		tree->node = (AlphaNode*)Realloc(tree->node, tree->maxSize * sizeof(AlphaNode));
 		pNew = tree->node + tree->curSize;
 	}
 	pNew->level = level;
@@ -261,50 +289,44 @@ void Flood(AlphaTree* tree, pixel* img, uint32 height, uint32 width, uint32 chan
 	uint32 iChild, *levelroot;
 	uint8 *isVisited;
 	uint32 *pParentAry;
-
-	double ddhist[256];
-
+	
 	imgsize = width * height;
 	nredges = width * (height - 1) + (width - 1) * height;
 	dimgsize = 2 * width * height; //To make indexing easier
 	numlevels = 1 << (8 * sizeof(uint8));
 
-	//tmp_mem_size = imgsize * ISVISITED_ELEMENT_SIZE + (nredges + 1) * (HQUEUE_ELEMENT_SIZE)+dimgsize * (DIMG_ELEMENT_SIZE)+ 
-	//numlevels * (LEVELROOT_ELEMENT_SIZE + DHIST_ELEMENT_SIZE + sizeof(hqueue_index)) + sizeof(hqueue_index) + LEVELROOT_ELEMENT_SIZE;
-
-
 	dhist = (uint32*)Malloc((size_t)numlevels * sizeof(uint32));
 	dimg = (uint8*)Malloc((size_t)dimgsize * sizeof(uint8));
-	levelroot = (uint32*)Malloc((uint32)(numlevels + 1) * LEVELROOT_ELEMENT_SIZE);
+	levelroot = (uint32*)Malloc((uint32)(numlevels + 1) * sizeof(uint32));
 	isVisited = (uint8*)Malloc((size_t)((imgsize + 7) >> 3));
 	for (p = 0; p < numlevels; p++)
 		levelroot[p] = NULL_LEVELROOT;
 	memset(dhist, 0, (size_t)numlevels * sizeof(uint32));
-	memset(isVisited, 0, (size_t)(imgsize >> 3));
+	memset(isVisited, 0, (size_t)((imgsize + 7) >> 3));
 
 	max_level = (uint8)(numlevels - 1);
 	
 	compute_dimg(dimg, dhist, img, height, width, channel);
 	dhist[max_level]++;
 	hqueue = hqueue_new(nredges + 1, dhist, numlevels);
-
-	for (p = 0; p < 256; p++)
-		ddhist[p] = (double)dhist[p] / nredges;
-
+	
 	tree->height = height;
 	tree->width = width;
 	tree->channel = channel;
 	tree->curSize = 0;
-	
-	//tree size estimation
-	rmsd = 0;
+
+	//tree size estimation (TSE)
+	nrmsd = 0;
 	for (p = 0; p < numlevels; p++)
-		rmsd += ((double)dhist[p]) * ((double)dhist[p]);
-	rmsd += (double)(nredges - 256);
-	nrmsd = sqrt((rmsd - (double)nredges) / ((double)nredges * ((double)nredges - 1.0)));
-	//nrmsd = sqrt((rmsd - (double)nredges) / (((double)nredges - 1.0) * (double)nredges));
-	tree->maxSize = min(imgsize, (uint32)(imgsize * (exp(-M_PI * nrmsd) + 0.03)));
-	
+		nrmsd += ((double)dhist[p]) * ((double)dhist[p]);
+	nrmsd = sqrt((nrmsd - (double)nredges) / ((double)nredges * ((double)nredges - 1.0)));
+	if (mem_scheme == TSE)
+		tree->maxSize = min(imgsize, (uint32)(imgsize * A * (exp(SIGMA * nrmsd) + B + M)));
+	else
+		tree->maxSize = (uint32)(imgsize * size_init[mem_scheme]);
+
+	Free(dhist);
+
 	tree->parentAry = (uint32*)Malloc((size_t)imgsize * sizeof(uint32));
 	tree->node = (AlphaNode*)Malloc((size_t)tree->maxSize * sizeof(AlphaNode));
 	pParentAry = tree->parentAry;
@@ -315,8 +337,6 @@ void Flood(AlphaTree* tree, pixel* img, uint32 height, uint32 width, uint32 chan
 	current_level = max_level;
 	x0 = imgsize >> 1;
 	hqueue_push(hqueue, x0, current_level);
-
-//	free(dhist);
 
 	iChild = levelroot[max_level + 1];
 	while (current_level <= max_level)
@@ -421,7 +441,6 @@ void Flood(AlphaTree* tree, pixel* img, uint32 height, uint32 width, uint32 chan
 	Free(dimg);
 	Free(levelroot);
 	Free(isVisited);
-	Free(dhist);
 }
 
 
@@ -443,100 +462,111 @@ int main(int argc, char **argv)
 	uint32 width, height, channel;
 	uint32 cnt = 0;
 	ofstream f;
+	ifstream fcheck;
+	char in;
+	uint32 i,contidx;
+	std::string path;
 
+	contidx = 0;
 //	f.open("C:/Users/jwryu/RUG/2018/AlphaTree/AlphaTree_grey_Exp.dat", std::ofstream::app);
-	f.open("C:/Users/jwryu/RUG/2018/AlphaTree/AlphaTree_grey_Exp.dat");
-	std::string path = INPUTIMAGE_DIR;
-	for (auto & p : std::experimental::filesystem::directory_iterator(path))
+	fcheck.open(OUTPUT_FNAME);
+	if (fcheck.good())
 	{
-		if (cnt++ < 2 - 2) 
+		cout << "Output file \"" << OUTPUT_FNAME << "\" already exists. Overwrite? (y/n/a)";
+		//cin >> in;
+		in = 'y';
+		if (in == 'a')
 		{
-			continue;
+			f.open(OUTPUT_FNAME, std::ofstream::app);
+			cout << "Start from : ";
+			cin >> contidx;
 		}
-		cv::String str1(p.path().string().c_str());
-		cv::Mat cvimg = imread(str1, cv::IMREAD_ANYCOLOR);
-		
-		height = cvimg.rows;
-		width = cvimg.cols;
-		channel = cvimg.channels();
-
-		cout << cnt << ": " << str1 << ' ' << height << 'x' << width << endl;
-
-		if (channel != 1)
-		{
-			cout << "input should be a greyscale image" << endl;
-			getc(stdin);
+		else if (in == 'y')
+			f.open(OUTPUT_FNAME);
+		else
 			exit(-1);
-		}
-
-		double runtime, minruntime;
-
-		for (int testrep = 0; testrep < REPEAT; testrep++)
-		{
-			memuse = max_memuse = 0;
-			auto wcts = std::chrono::system_clock::now();
-
-			tree = (AlphaTree*)Malloc(sizeof(AlphaTree));
-			//		start = clock();
-			BuildAlphaTree(tree, cvimg.data, height, width, channel);
-
-			std::chrono::duration<double> wctduration = (std::chrono::system_clock::now() - wcts);
-			runtime = wctduration.count();
-			minruntime = testrep == 0 ? runtime : min(runtime, minruntime);
-
-			if (testrep < (REPEAT - 1))
-				DeleteAlphaTree(tree);
-		}
-		f << p.path().string().c_str() << '\t' << height << '\t' << width << '\t' << max_memuse << '\t' << nrmsd << '\t' << tree->maxSize << '\t' << tree->curSize << endl;
-
-		//img = (pixel*)malloc(height * width * sizeof(pixel));
+	}
+	else
+		f.open(OUTPUT_FNAME);
 	
-		//	printf("Image size: %dx%dx%d", img.rows, img.cols, img.channels());
-			//	gettimeofday(&start, NULL);
+	cnt = 0;
+	for (mem_scheme = 0; mem_scheme < 4; mem_scheme++) // memory scheme loop (TSE, Max, Linear, Exp)
+	{
+#if RUN_TSE_ONLY
+		if (mem_scheme > 0)
+			break;
+#endif
+		for (i = 0; i < 2; i++) // grey, colour loop
+		{
+			if (i == 0)
+				path = INPUTIMAGE_DIR;
+			else
+				path = INPUTIMAGE_DIR_COLOUR;
 
+			for (auto & p : std::experimental::filesystem::directory_iterator(path))
+			{
+				if (++cnt < contidx)
+				{
+					cout << cnt << ": " << p << endl;
+					continue;
+				}
+				cv::String str1(p.path().string().c_str());
+				cv::Mat cvimg;
+				if (i == 0)
+					cvimg = imread(str1, cv::IMREAD_GRAYSCALE);
+				else
+				{
+					cvimg = imread(str1, cv::IMREAD_COLOR);
+					cv::cvtColor(cvimg, cvimg, CV_BGR2GRAY);
+				}
 
-		//	gettimeofday(&stop, NULL);
-		//		namedWindow("disp", WINDOW_AUTOSIZE); // Create a window for display.
-			//	imshow("disp", img);                // Show our image inside it.
-				//waitKey(0);
-		cout<<"Time Elapsed: " << minruntime << endl;
-		//getc(stdin);
-//		free(img);
-		cvimg.release();
-		str1.clear();
+				/*
+				cv::namedWindow("Display window", cv::WINDOW_AUTOSIZE);// Create a window for display.
+				cv::imshow("Display window", cvimg);                   // Show our image inside it.
+				cv::waitKey(0);
+				getc(stdin);
+				*/
 
-		DeleteAlphaTree(tree);
+				height = cvimg.rows;
+				width = cvimg.cols;
+				channel = cvimg.channels();
+
+				cout << cnt << ": " << str1 << ' ' << height << 'x' << width << endl;
+
+				if (channel != 1)
+				{
+					cout << "input should be a greyscale image" << endl;
+					getc(stdin);
+					exit(-1);
+				}
+
+				double runtime, minruntime;
+				for (int testrep = 0; testrep < REPEAT; testrep++)
+				{
+					memuse = max_memuse = 0;
+					auto wcts = std::chrono::system_clock::now();
+
+					tree = (AlphaTree*)Malloc(sizeof(AlphaTree));
+					//		start = clock();
+					BuildAlphaTree(tree, cvimg.data, height, width, channel);
+
+					std::chrono::duration<double> wctduration = (std::chrono::system_clock::now() - wcts);
+					runtime = wctduration.count();
+					minruntime = testrep == 0 ? runtime : min(runtime, minruntime);
+
+					if (testrep < (REPEAT - 1))
+						DeleteAlphaTree(tree);
+				}
+				f << p.path().string().c_str() << '\t' << height << '\t' << width << '\t' << max_memuse << '\t' << nrmsd << '\t' << tree->maxSize << '\t' << tree->curSize << '\t' << minruntime << mem_scheme << i << endl;
+
+				cout << "Time Elapsed: " << minruntime << endl;
+				cvimg.release();
+				str1.clear();
+				DeleteAlphaTree(tree);
+			}
+		}
 	}
 
-
-	
-
-	
-		//	cv::String str("C:/jwryu/RUG/2018/AlphaTree/imgdata/Colour_imgs/16578511714_6eaef1c5bb_o.jpg");
-//	cv::Mat img = imread(str, CV_LOAD_IMAGE_COLOR);
-//	cv::String str("C:/jwryu/RUG/2018/AlphaTree/imgdata/Aerial_Grey/s-gravenhage_33696704805_o.jpg");
-//	cv::Mat img = imread(str, CV_LOAD_IMAGE_GRAYSCALE);
-	/*
-	uint32 height, width, channel;
-	
-	char fname[] = "C:/jwryu/RUG/2018/AlphaTree/imgdata/remote_sensing_img_8bit_8281x8185.raw";
-	height = 8281;
-	width = 8185;
-	channel = 1;
-	uint8 *img;
-	FILE *fp;
-
-	img = (uint8*)malloc(height*width*sizeof(uint8));
-	fopen_s(&fp, fname, "r");
-	fread(img, sizeof(uint8), height*width*channel, fp);
-	fclose(fp);
-	memcpy(img, img1.data, height*width*channel*sizeof(uint8));
-	*/
-	//uint8 testimg[9] = { 4, 4, 1, 4, 2, 2, 1, 2, 0 };
-
-	//AlphaTree aTree;
-	//	struct timeval stop, start;
-	
-//	img.release();
+	f.close();
 	return 0;
 }
