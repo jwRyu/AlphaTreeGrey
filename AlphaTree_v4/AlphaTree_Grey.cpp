@@ -14,13 +14,13 @@
 #include <fstream>
 using namespace std;
 
-#define OUTPUT_FNAME "C:/Users/jwryu/RUG/2018/AlphaTree/test.dat"
+#define OUTPUT_FNAME "C:/Users/jwryu/Google Drive/RUG/2018/AlphaTree/AlphaTree_grey_1rep.dat"
 
 #define INPUTIMAGE_DIR	"C:/Users/jwryu/Google Drive/RUG/2018/AlphaTree/imgdata/Grey"
 #define INPUTIMAGE_DIR_COLOUR	"C:/Users/jwryu/Google Drive/RUG/2018/AlphaTree/imgdata/Colour" //colour images are used after rgb2grey conversion
 #define REPEAT 1
 #define RUN_TSE_ONLY 0
-#define RUN_MAX_ONLY 1
+#define RUN_MAX_ONLY 0
 
 #define DEBUG 0
 #define max(a,b) (a)>(b)?(a):(b)
@@ -40,10 +40,10 @@ using namespace std;
 #define UP_AVAIL(pidx,width)				((pidx) > ((width) - 1))
 #define DOWN_AVAIL(pidx,width,imgsz)		((pidx) < (imgsz) - (width))
 
-#define A		1.10184
-#define SIGMA	-2.6912
-#define B		-0.0608
-#define M		0.03
+#define A		1.3901
+#define SIGMA	-2.1989
+#define B		-0.1906
+#define M		0.05
 
 //Memory allocation reallocation schemes
 #define TSE 0
@@ -51,9 +51,9 @@ using namespace std;
 #define LINEAR 2
 #define EXP 3
 int mem_scheme = -1;
-double size_init[4] = { -1, 1, .2, .15 };
+double size_init[4] = { -1, 1, .2, .2 };
 double size_mul[4] = { 1, 1, 1, 2 };
-double size_add[4] = { .05, 0, 0.15, 0 };
+double size_add[4] = { .05, 0, 0.2, 0 };
 
 typedef unsigned char uint8;
 typedef unsigned short uint16;
@@ -69,6 +69,7 @@ typedef uint8 pixel; //designed for 8-bit images
 double nrmsd;
 
 size_t memuse, max_memuse;
+
 
 #if DEBUG
 void* buf;
@@ -279,15 +280,16 @@ inline void connectPix2Node(int32* parentAry, int32 pidx, pixel pix_val, AlphaNo
 #endif
 
 #if DELAYED_ANODE_ALLOC
-inline void connectNode2Node(AlphaTree *tree, int32* levelroot, AlphaNode* pChild, int32 level)
+inline void connectNode2Node(AlphaTree *tree, int32* levelroot, int32 iChild, int32 level)
 {
-	AlphaNode *pPar;
+	AlphaNode *pPar, *pChild;
 	int32 iPar = levelroot[level];
 	if (iPar == ANODE_CANDIDATE)
 	{
 		iPar = NewAlphaNode(tree);
 		levelroot[level] = iPar;
 		pPar = tree->node + iPar;
+		pChild = tree->node + iChild;
 		pChild->parentidx = iPar;
 		pPar->area = pChild->area;
 		pPar->maxPix = pChild->maxPix;
@@ -298,6 +300,7 @@ inline void connectNode2Node(AlphaTree *tree, int32* levelroot, AlphaNode* pChil
 	else
 	{
 		pPar = tree->node + iPar;
+		pChild = tree->node + iChild;
 		pChild->parentidx = iPar;
 		pPar->area += pChild->area;
 		pPar->maxPix = max(pChild->maxPix, pPar->maxPix);
@@ -391,16 +394,18 @@ void Flood(AlphaTree* tree, pixel* img, int32 height, int32 width, int32 channel
 	tree->channel = channel;
 	tree->curSize = 0;
 
+	/////////////////////////////////////////
 	//tree size estimation (TSE)
 	nrmsd = 0;
 	for (p = 0; p < numlevels; p++)
 		nrmsd += ((double)dhist[p]) * ((double)dhist[p]);
 	nrmsd = sqrt((nrmsd - (double)nredges) / ((double)nredges * ((double)nredges - 1.0)));
 	if (mem_scheme == TSE)
-		tree->maxSize = min(imgsize, (int32)(imgsize * A * (exp(SIGMA * nrmsd) + B + M)));
+		tree->maxSize = min(2 * imgsize, (int32)(2 * imgsize * ((A * exp(SIGMA * nrmsd) + B) + M)));
 	else
 		tree->maxSize = (int32)(2 * imgsize * size_init[mem_scheme]);
-
+	/////////////////////////////////////////
+//	printf("NRMSD: %f\tEst. NTS: %f\tEst. Tree size: %d\n", nrmsd, ((A * exp(SIGMA * nrmsd) + B) + M), tree->maxSize);
 	Free(dhist);
 
 	tree->parentAry = (int32*)Malloc((size_t)imgsize * sizeof(int32));
@@ -510,7 +515,7 @@ void Flood(AlphaTree* tree, pixel* img, int32 height, int32 width, int32 channel
 		while (next_level <= max_level && (levelroot[next_level] == NULL_LEVELROOT))
 			next_level++;
 #if DELAYED_ANODE_ALLOC
-		connectNode2Node(tree, levelroot, tree->node + levelroot[current_level], next_level);
+		connectNode2Node(tree, levelroot, levelroot[current_level], next_level);
 #else
 		connectNode2Node(tree->node + levelroot[next_level], levelroot[next_level], tree->node + levelroot[current_level]);
 #endif
@@ -524,7 +529,7 @@ void Flood(AlphaTree* tree, pixel* img, int32 height, int32 width, int32 channel
 	{
 		if (tree->node[pParentAry[p]].level)//Singleton 0-CC
 		{
-			x0 = tree->curSize++;
+			x0 = NewAlphaNode(tree);
 			tree->node[x0].level = 0;
 			tree->node[x0].area = 1;
 			tree->node[x0].maxPix =
@@ -567,13 +572,13 @@ int main(int argc, char **argv)
 	uint8 testimg[4 * 4] = { 4, 4, 2, 0, 4, 1, 1, 0, 0, 3, 0, 0, 2, 2, 0, 5 };
 
 	contidx = 0;
-//	f.open("C:/Users/jwryu/RUG/2018/AlphaTree/AlphaTree_grey_Exp.dat", std::ofstream::app);
+	//f.open("C:/Users/jwryu/RUG/2018/AlphaTree/AlphaTree_grey_Exp.dat", std::ofstream::app);
 	fcheck.open(OUTPUT_FNAME);
 	if (fcheck.good())
 	{
 		cout << "Output file \"" << OUTPUT_FNAME << "\" already exists. Overwrite? (y/n/a)";
-		//cin >> in;
-		in = 'y';
+		cin >> in;
+		//in = 'y';
 		if (in == 'a')
 		{
 			f.open(OUTPUT_FNAME, std::ofstream::app);
@@ -662,7 +667,8 @@ int main(int argc, char **argv)
 					if (testrep < (REPEAT - 1))
 						DeleteAlphaTree(tree);
 				}
-				f << p.path().string().c_str() << '\t' << height << '\t' << width << '\t' << max_memuse << '\t' << nrmsd << '\t' << tree->maxSize << '\t' << tree->curSize << '\t' << minruntime << mem_scheme << i << endl;
+				f << p.path().string().c_str() << '\t' << height << '\t' << width << '\t' << max_memuse << '\t' << nrmsd << '\t' << tree->maxSize 
+					<< '\t' << tree->curSize << '\t' << minruntime << '\t' << mem_scheme << endl;
 
 				cout << "Time Elapsed: " << minruntime << endl;
 				cvimg.release();
